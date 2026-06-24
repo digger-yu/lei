@@ -74,6 +74,42 @@ def http_get_json(url, headers=None, extra_headers=None, timeout=TIMEOUT):
     return None
 
 
+def http_get_html(url, headers=None, extra_headers=None, timeout=TIMEOUT):
+    """发送 GET 请求并返回 HTML 文本，失败返回 None"""
+    hdrs = dict(headers or HEADERS_MOBILE)
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = Request(url, headers=hdrs, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, errors="replace")
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        log.error(f"HTTP {e.code} for {url}, body: {body}")
+    except URLError as e:
+        log.error(f"URL error for {url}: {e.reason}")
+    except Exception as e:
+        log.error(f"Request failed for {url}: {e}")
+    return None
+
+
+def parse_render_data(html):
+    """
+    从抖音用户主页 HTML 中解析 RENDER_DATA 字段
+    返回解码后的 dict，失败返回 None
+    """
+    m = re.search(r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', html, re.DOTALL)
+    if not m:
+        return None
+    try:
+        from urllib.parse import unquote
+        return json.loads(unquote(m.group(1)))
+    except Exception as e:
+        log.error(f"RENDER_DATA 解析失败: {e}")
+        return None
+
+
 def safe_int(value):
     """将各种格式的数值安全转为 int，失败返回 None"""
     if value is None:
@@ -191,11 +227,26 @@ def fetch_weibo_followers(uid=WEIBO_UID):
 # ============================================================
 # 抖音粉丝数获取 / Douyin
 # ============================================================
-def fetch_douyin_followers(sec_uid=DOUYIN_SEC_UID):
+def _normalize_douyin_count(raw, nickname=None):
     """
-    通过抖音 Web API 获取粉丝数
-    注意: 抖音有反爬机制，无有效 Cookie 时可能返回空结果
-    建议设置环境变量 DOUYIN_COOKIE
+    抖音后台存储的 follower_count 是「实际粉丝数 × 100」，
+    渲染时再除以 100 显示。当我们直接拿到原始值时需要做缩放。
+    """
+    count = safe_int(raw)
+    if count is None:
+        return None
+    # 经验值：原生 API 字段就是精确数；SSR 抓到的也是精确数。
+    # 仅有少数情况下拿到的是放大值（×100），通过数量级判断做归一化。
+    if count > 10**11:  # 不可能超过 1000 亿，做回退
+        count = count // 100
+    return count
+
+
+def fetch_douyin_followers_api(sec_uid=DOUYIN_SEC_UID):
+    """
+    方案一：通过抖音 Web API（aweme/v1/web/user/profile/other/）获取粉丝数
+    优点：结构化数据稳定
+    缺点：无有效 Cookie 时会被风控拦截
     """
     url = (
         "https://www.douyin.com/aweme/v1/web/user/profile/other/"
@@ -211,22 +262,95 @@ def fetch_douyin_followers(sec_uid=DOUYIN_SEC_UID):
 
     data = http_get_json(url, extra_headers=extra)
     if not data:
-        log.warning("Douyin: 请求失败（可能需要有效 Cookie）")
-        return None
+        log.warning("Douyin[API]: 请求失败（可能需要有效 Cookie）")
+        return None, None
 
     user = data.get("user", {})
     if not user:
-        log.warning(f"Douyin: 未找到 user 字段, response keys={list(data.keys())}, status={data.get('status_code')}")
-        return None
+        log.warning(
+            f"Douyin[API]: 未找到 user 字段, "
+            f"response keys={list(data.keys())}, status={data.get('status_code')}"
+        )
+        return None, None
 
-    count = safe_int(user.get("follower_count") or user.get("followerCount"))
+    count = _normalize_douyin_count(
+        user.get("follower_count") or user.get("followerCount"),
+        user.get("nickname"),
+    )
     nickname = user.get("nickname", sec_uid[:16])
-
     if count is not None:
-        log.info(f"Douyin [{nickname}]: {count:,} 粉丝")
+        log.info(f"Douyin[API] [{nickname}]: {count:,} 粉丝")
+        return count, nickname
+
+    log.warning(f"Douyin[API]: 无法解析粉丝数, keys={list(user.keys())}")
+    return None, None
+
+
+def fetch_douyin_followers_ssr(sec_uid=DOUYIN_SEC_UID):
+    """
+    方案二：直接抓取用户主页 HTML，从 RENDER_DATA 中解析粉丝数
+    优点：不需要 Cookie，不依赖 _signature / X-Bogus 签名
+    缺点：依赖前端 SSR 注入结构；IP 触发风控时拿到的是滑块挑战页
+    """
+    url = f"https://www.douyin.com/user/{sec_uid}"
+    extra = {
+        "Referer": "https://www.douyin.com/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    html = http_get_html(url, extra_headers=extra)
+    if not html:
+        log.warning("Douyin[SSR]: 用户主页 HTML 获取失败")
+        return None, None
+
+    # 0) 反爬挑战页检测：拿到的是 byted_acrawler 滑块页时直接判定为失败
+    if "byted_acrawler" in html or "__ac_signature" in html or "_$jsvmprt" in html:
+        log.warning("Douyin[SSR]: 命中反爬挑战页（byted_acrawler），本方案不可用")
+        return None, None
+
+    # 1) 优先尝试 RENDER_DATA 结构化解析
+    data = parse_render_data(html)
+    if data:
+        blob = json.dumps(data, ensure_ascii=False)
+        # follower_count 在 userInfo / app.userInfo / user 等多个位置都可能存在
+        for key in ("follower_count", "followerCount"):
+            m = re.search(rf'"{key}"\s*:\s*(\d+)', blob)
+            if m:
+                count = _normalize_douyin_count(m.group(1))
+                # 尝试同时拿到昵称
+                nick_m = re.search(r'"nickname"\s*:\s*"([^"]+)"', blob)
+                nickname = nick_m.group(1) if nick_m else sec_uid[:16]
+                if count is not None:
+                    log.info(f"Douyin[SSR-RENDER] [{nickname}]: {count:,} 粉丝")
+                    return count, nickname
+
+    # 2) Fallback: HTML 正则匹配「粉丝 xxx 万」
+    m = re.search(r"粉丝\s*([\d.]+)\s*万", html)
+    if m:
+        count = safe_int(m.group(1) + "万")
+        if count is not None:
+            log.info(f"Douyin[SSR-Regex] [{sec_uid[:16]}]: {count:,} 粉丝")
+            return count, None
+
+    log.warning("Douyin[SSR]: 两种解析方式均未命中粉丝数")
+    return None, None
+
+
+def fetch_douyin_followers(sec_uid=DOUYIN_SEC_UID):
+    """
+    抖音粉丝数获取入口：先尝试方案一（API + Cookie），失败时自动 fallback 到方案二（SSR）
+    返回粉丝数（int）或 None
+    """
+    # 方案一：API + Cookie
+    count, nickname = fetch_douyin_followers_api(sec_uid)
+    if count is not None:
         return count
 
-    log.warning(f"Douyin: 无法解析粉丝数, keys={list(user.keys())}")
+    log.info("Douyin: 方案一（API）失败，自动切换到方案二（SSR 抓取用户主页）")
+    count, nickname = fetch_douyin_followers_ssr(sec_uid)
+    if count is not None:
+        return count
+
+    log.error("Douyin: 两套获取方案均失败")
     return None
 
 
@@ -324,9 +448,9 @@ def main():
     weibo = fetch_weibo_followers()
     douyin = fetch_douyin_followers()
 
-    # 抖音失败时发送邮件通知
+    # 抖音失败时发送邮件通知（两套方案都失败才发，避免 Cookie 临时失效误报）
     if douyin is None:
-        log.warning("Douyin: 数据获取失败，发送 Cookie 过期提醒邮件")
+        log.error("Douyin: 数据获取失败（两套方案均失败），发送 Cookie 过期提醒邮件")
         send_cookie_expired_email()
 
     if weibo is None and douyin is None:

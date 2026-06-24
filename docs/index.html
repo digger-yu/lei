@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>雷军粉丝追踪 - Lei Jun Follower Tracker</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #1a1d27;
+      --border: #2a2d3a;
+      --text: #e4e4e7;
+      --text-muted: #9ca3af;
+      --weibo: #ff6b35;
+      --weibo-bg: rgba(255, 107, 53, 0.08);
+      --douyin: #00d4aa;
+      --douyin-bg: rgba(0, 212, 170, 0.08);
+      --accent: #6366f1;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1.5rem;
+    }
+    .container { max-width: 920px; margin: 0 auto; }
+
+    /* Header */
+    .header { text-align: center; margin-bottom: 2.5rem; }
+    .header h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6366f1, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .header .sub {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-top: 0.4rem;
+    }
+
+    /* Stat cards */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+    }
+    .card .label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .card .value {
+      font-size: 1.6rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .card .change {
+      font-size: 0.85rem;
+      margin-top: 0.35rem;
+    }
+    .up { color: #22c55e; }
+    .down { color: #ef4444; }
+    .neutral { color: var(--text-muted); }
+
+    .card.weibo { border-left: 3px solid var(--weibo); }
+    .card.weibo .value { color: var(--weibo); }
+    .card.douyin { border-left: 3px solid var(--douyin); }
+    .card.douyin .value { color: var(--douyin); }
+
+    /* Chart */
+    .chart-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .chart-wrap h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+    .chart-box { position: relative; height: 380px; }
+
+    /* Table */
+    .table-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .table-wrap h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+    .scroll { max-height: 320px; overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th {
+      text-align: left;
+      padding: 0.6rem 0.8rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-muted);
+      font-weight: 500;
+      position: sticky;
+      top: 0;
+      background: var(--card);
+    }
+    td {
+      padding: 0.55rem 0.8rem;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    tbody tr:hover { background: rgba(255,255,255,0.02); }
+    .num { font-variant-numeric: tabular-nums; }
+
+    /* Footer */
+    .footer {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      padding-top: 1rem;
+    }
+    .footer a { color: var(--accent); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+
+    /* Loading */
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 200px;
+      color: var(--text-muted);
+      font-size: 0.95rem;
+    }
+    .loading::before {
+      content: "";
+      width: 20px; height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 0.6rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>雷军粉丝追踪</h1>
+    <p class="sub">Lei Jun Follower Tracker &middot; 每日自动更新</p>
+  </div>
+
+  <div class="stats" id="stats">
+    <div class="card weibo"><div class="label">微博粉丝</div><div class="value">--</div></div>
+    <div class="card douyin"><div class="label">抖音粉丝</div><div class="value">--</div></div>
+  </div>
+
+  <div class="chart-wrap">
+    <h2>粉丝变化趋势 / Follower Trend</h2>
+    <div class="chart-box"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="table-wrap">
+    <h2>历史数据 / History</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>日期</th>
+          <th>微博粉丝</th>
+          <th>微博变化</th>
+          <th>抖音粉丝</th>
+          <th>抖音变化</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>数据来源：微博 &middot; 抖音 &nbsp;|&nbsp; 每日北京时间 10:00 自动采集</p>
+    <p style="margin-top: 0.3rem;">
+      <a href="https://github.com" target="_blank">GitHub Repository</a>
+    </p>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// 配置 - 部署时替换为你的仓库 raw 地址
+// ============================================================
+const DATA_URL = "./data.json";
+
+// ============================================================
+// 工具函数
+// ============================================================
+function fmt(n) {
+  if (n == null) return "--";
+  return n.toLocaleString("zh-CN");
+}
+
+function fmtWan(n) {
+  if (n == null) return "--";
+  return (n / 10000).toFixed(2) + " 万";
+}
+
+function diffStr(cur, prev) {
+  if (cur == null || prev == null) return '<span class="neutral">--</span>';
+  const d = cur - prev;
+  if (d === 0) return '<span class="neutral">0</span>';
+  const cls = d > 0 ? "up" : "down";
+  const arrow = d > 0 ? "+" : "";
+  return `<span class="${cls}">${arrow}${d.toLocaleString("zh-CN")}</span>`;
+}
+
+// ============================================================
+// 渲染统计卡片
+// ============================================================
+function renderStats(records) {
+  if (records.length === 0) return;
+  const latest = records[records.length - 1];
+  const prev = records.length > 1 ? records[records.length - 2] : null;
+
+  let html = "";
+
+  // 微博卡片
+  html += `<div class="card weibo">
+    <div class="label">微博粉丝 WEIBO</div>
+    <div class="value">${fmt(latest.weibo)}</div>`;
+  if (latest.weibo != null) {
+    html += `<div class="value" style="font-size:0.9rem;color:var(--text-muted);font-weight:400">${fmtWan(latest.weibo)}</div>`;
+  }
+  if (prev && latest.weibo != null && prev.weibo != null) {
+    const d = latest.weibo - prev.weibo;
+    const cls = d > 0 ? "up" : d < 0 ? "down" : "neutral";
+    const sign = d > 0 ? "+" : "";
+    html += `<div class="change ${cls}">日变化: ${sign}${d.toLocaleString("zh-CN")}</div>`;
+  }
+  html += "</div>";
+
+  // 抖音卡片
+  html += `<div class="card douyin">
+    <div class="label">抖音粉丝 DOUYIN</div>
+    <div class="value">${fmt(latest.douyin)}</div>`;
+  if (latest.douyin != null) {
+    html += `<div class="value" style="font-size:0.9rem;color:var(--text-muted);font-weight:400">${fmtWan(latest.douyin)}</div>`;
+  }
+  if (prev && latest.douyin != null && prev.douyin != null) {
+    const d = latest.douyin - prev.douyin;
+    const cls = d > 0 ? "up" : d < 0 ? "down" : "neutral";
+    const sign = d > 0 ? "+" : "";
+    html += `<div class="change ${cls}">日变化: ${sign}${d.toLocaleString("zh-CN")}</div>`;
+  }
+  html += "</div>";
+
+  // 汇总卡片
+  if (latest.weibo != null && latest.douyin != null) {
+    const total = latest.weibo + latest.douyin;
+    html += `<div class="card">
+      <div class="label">全平台总计 TOTAL</div>
+      <div class="value">${fmt(total)}</div>
+      <div class="value" style="font-size:0.9rem;color:var(--text-muted);font-weight:400">${fmtWan(total)}</div>`;
+    if (prev && prev.weibo != null && prev.douyin != null) {
+      const d = total - (prev.weibo + prev.douyin);
+      const cls = d > 0 ? "up" : d < 0 ? "down" : "neutral";
+      const sign = d > 0 ? "+" : "";
+      html += `<div class="change ${cls}">日变化: ${sign}${d.toLocaleString("zh-CN")}</div>`;
+    }
+    html += "</div>";
+  }
+
+  // 采集天数
+  html += `<div class="card">
+    <div class="label">采集天数 DAYS</div>
+    <div class="value">${records.length}</div>
+    <div class="change neutral">${records[0].date} ~ ${latest.date}</div>
+  </div>`;
+
+  document.getElementById("stats").innerHTML = html;
+}
+
+// ============================================================
+// 渲染图表
+// ============================================================
+let chart = null;
+function renderChart(records) {
+  const ctx = document.getElementById("chart").getContext("2d");
+  const labels = records.map(r => r.date);
+
+  if (chart) chart.destroy();
+
+  chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "微博粉丝",
+          data: records.map(r => r.weibo),
+          borderColor: "#ff6b35",
+          backgroundColor: "rgba(255, 107, 53, 0.08)",
+          fill: true,
+          tension: 0.3,
+          pointRadius: records.length > 60 ? 0 : 3,
+          pointHoverRadius: 5,
+          borderWidth: 2,
+          spanGaps: true,
+        },
+        {
+          label: "抖音粉丝",
+          data: records.map(r => r.douyin),
+          borderColor: "#00d4aa",
+          backgroundColor: "rgba(0, 212, 170, 0.08)",
+          fill: true,
+          tension: 0.3,
+          pointRadius: records.length > 60 ? 0 : 3,
+          pointHoverRadius: 5,
+          borderWidth: 2,
+          spanGaps: true,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          labels: {
+            color: "#9ca3af",
+            font: { size: 12 },
+            usePointStyle: true,
+            pointStyle: "circle",
+          }
+        },
+        tooltip: {
+          backgroundColor: "#1a1d27",
+          borderColor: "#2a2d3a",
+          borderWidth: 1,
+          titleColor: "#e4e4e7",
+          bodyColor: "#e4e4e7",
+          padding: 12,
+          displayColors: true,
+          callbacks: {
+            label(ctx) {
+              if (ctx.raw == null) return null;
+              return `${ctx.dataset.label}: ${ctx.raw.toLocaleString("zh-CN")} (${(ctx.raw / 10000).toFixed(1)}万)`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: "#6b7280",
+            maxTicksLimit: 10,
+            font: { size: 11 },
+          },
+          grid: { color: "rgba(255,255,255,0.04)" }
+        },
+        y: {
+          ticks: {
+            color: "#6b7280",
+            font: { size: 11 },
+            callback(v) { return (v / 10000).toFixed(0) + "万"; }
+          },
+          grid: { color: "rgba(255,255,255,0.04)" }
+        }
+      }
+    }
+  });
+}
+
+// ============================================================
+// 渲染表格
+// ============================================================
+function renderTable(records) {
+  const tbody = document.getElementById("tbody");
+  // 最新的在前面
+  const sorted = [...records].reverse();
+  let html = "";
+  sorted.forEach((r, i) => {
+    const idx = records.length - 1 - i;
+    const prev = idx > 0 ? records[idx - 1] : null;
+    html += `<tr>
+      <td>${r.date}</td>
+      <td class="num">${fmt(r.weibo)}</td>
+      <td>${diffStr(r.weibo, prev ? prev.weibo : null)}</td>
+      <td class="num">${fmt(r.douyin)}</td>
+      <td>${diffStr(r.douyin, prev ? prev.douyin : null)}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = html;
+}
+
+// ============================================================
+// 加载数据
+// ============================================================
+async function init() {
+  try {
+    const resp = await fetch(DATA_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    if (!data.records || data.records.length === 0) {
+      document.getElementById("stats").innerHTML =
+        '<div class="loading">暂无数据，等待首次采集...</div>';
+      return;
+    }
+
+    renderStats(data.records);
+    renderChart(data.records);
+    renderTable(data.records);
+  } catch (e) {
+    console.error("数据加载失败:", e);
+    document.getElementById("stats").innerHTML =
+      `<div class="card" style="grid-column:1/-1">
+        <div class="label">错误</div>
+        <div class="value" style="font-size:1rem;color:#ef4444">数据加载失败: ${e.message}</div>
+        <div class="change neutral">请检查 data.json 是否存在，或 GitHub Pages 是否已启用</div>
+      </div>`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>

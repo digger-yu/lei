@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+雷军抖音 & 微博粉丝数每日追踪脚本
+Lei Jun Douyin & Weibo Follower Count Daily Tracker
+
+用法 / Usage:
+    python scripts/fetch_data.py              # 正常运行，跳过已有当日数据
+    python scripts/fetch_data.py --overwrite  # 强制覆盖当日数据
+    python scripts/fetch_data.py --test       # 测试模式，不写入文件
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone, timedelta
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+# ============================================================
+# 配置 / Configuration
+# ============================================================
+WEIBO_UID = "1749127163"                       # 雷军微博 UID（注意：2397992731 是异常账号）
+DOUYIN_SEC_UID = "MS4wLjABAAAAompXkPoYOGsA152dqYoytKycjIZ_aCCxHwGmLX5IsDM"  # 雷军抖音 sec_uid（抖音号：xmleijun）
+DATA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "data.json")
+TIMEOUT = 30  # 请求超时秒数
+TZ = timezone(timedelta(hours=8))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("fetch_data")
+
+HEADERS_MOBILE = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+
+# ============================================================
+# 网络请求工具 / HTTP helpers
+# ============================================================
+def http_get_json(url, headers=None, extra_headers=None, timeout=TIMEOUT):
+    """发送 GET 请求并返回 JSON，失败返回 None"""
+    hdrs = dict(headers or HEADERS_MOBILE)
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = Request(url, headers=hdrs, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            body = resp.read().decode(charset, errors="replace")
+            return json.loads(body)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        log.error(f"HTTP {e.code} for {url}, body: {body}")
+    except URLError as e:
+        log.error(f"URL error for {url}: {e.reason}")
+    except json.JSONDecodeError as e:
+        log.error(f"JSON parse error for {url}: {e}, body preview: {body[:200] if 'body' in dir() else 'N/A'}")
+    except Exception as e:
+        log.error(f"Request failed for {url}: {e}")
+    return None
+
+
+def safe_int(value):
+    """将各种格式的数值安全转为 int，失败返回 None"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().lower().replace(",", "")
+    try:
+        if s.endswith(("万", "w")):
+            return int(float(s[:-1]) * 10000)
+        if s.endswith(("亿", "e")):
+            return int(float(s[:-1]) * 100000000)
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# 微博访客 Cookie / Weibo Visitor Cookie
+# ============================================================
+UA_DESKTOP = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def get_visitor_cookie():
+    """
+    通过微博访客系统自动获取临时 Cookie（SUB / SUBP）
+    无需登录，有效期有限，适合定时任务场景
+    """
+    # Step 1: 获取访客 tid
+    url1 = "https://passport.weibo.com/visitor/genvisitor"
+    data1 = b"cb=gen_callback&fp=%7B%7D"
+    req1 = Request(url1, data=data1, method="POST", headers={
+        "User-Agent": UA_DESKTOP,
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    with urlopen(req1, timeout=TIMEOUT) as resp1:
+        body1 = resp1.read().decode("utf-8")
+    tid_m = re.search(r'"tid"\s*:\s*"([^"]+)"', body1)
+    if not tid_m:
+        log.error(f"Weibo visitor: 无法获取 tid, response: {body1[:200]}")
+        return None
+    tid = tid_m.group(1)
+
+    # Step 2: 用 tid 换取 SUB / SUBP
+    url2 = (
+        f"https://passport.weibo.com/visitor/visitor"
+        f"?a=incarnate&t={tid}&w=2&c=095&cb=cross_domain&from=weibo"
+    )
+    req2 = Request(url2, headers={"User-Agent": UA_DESKTOP})
+    with urlopen(req2, timeout=TIMEOUT) as resp2:
+        body2 = resp2.read().decode("utf-8")
+    sub_m = re.search(r'"sub"\s*:\s*"([^"]+)"', body2)
+    subp_m = re.search(r'"subp"\s*:\s*"([^"]+)"', body2)
+    if not sub_m or not subp_m:
+        log.error(f"Weibo visitor: 无法获取 Cookie, response: {body2[:200]}")
+        return None
+    return f"SUB={sub_m.group(1)}; SUBP={subp_m.group(1)}"
+
+
+# ============================================================
+# 微博粉丝数获取 / Weibo
+# ============================================================
+def fetch_weibo_followers(uid=WEIBO_UID):
+    """
+    通过微博 AJAX API + 访客 Cookie 获取粉丝数（免登录）
+    """
+    try:
+        cookie = get_visitor_cookie()
+        if not cookie:
+            log.warning("Weibo: 访客 Cookie 获取失败")
+            return None
+    except Exception as e:
+        log.error(f"Weibo: 访客 Cookie 异常: {e}")
+        return None
+
+    url = f"https://weibo.com/ajax/profile/info?uid={uid}"
+    req = Request(url, headers={
+        "User-Agent": UA_DESKTOP,
+        "Cookie": cookie,
+        "Referer": f"https://weibo.com/u/{uid}",
+    })
+    try:
+        with urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        log.error(f"Weibo: HTTP {e.code}")
+        return None
+    except Exception as e:
+        log.error(f"Weibo: 请求异常: {e}")
+        return None
+
+    if data.get("ok") != 1:
+        log.warning(f"Weibo: API 返回异常 ok={data.get('ok')}, response: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return None
+
+    user = data.get("data", {}).get("user", {})
+    if not user:
+        log.warning("Weibo: 未找到 user 字段")
+        return None
+
+    count = safe_int(user.get("followers_count"))
+    screen = user.get("screen_name", uid)
+
+    if count is not None:
+        log.info(f"Weibo [{screen}]: {count:,} 粉丝")
+        return count
+
+    log.warning(f"Weibo: 无法解析粉丝数, keys={list(user.keys())}")
+    return None
+
+
+# ============================================================
+# 抖音粉丝数获取 / Douyin
+# ============================================================
+def fetch_douyin_followers(sec_uid=DOUYIN_SEC_UID):
+    """
+    通过抖音 Web API 获取粉丝数
+    注意: 抖音有反爬机制，无有效 Cookie 时可能返回空结果
+    建议设置环境变量 DOUYIN_COOKIE
+    """
+    url = (
+        "https://www.douyin.com/aweme/v1/web/user/profile/other/"
+        f"?sec_user_id={sec_uid}&aid=6383&device_platform=webapp"
+    )
+    cookie = os.environ.get("DOUYIN_COOKIE", "")
+    extra = {
+        "Referer": "https://www.douyin.com/",
+        "Accept": "application/json",
+    }
+    if cookie:
+        extra["Cookie"] = cookie
+
+    data = http_get_json(url, extra_headers=extra)
+    if not data:
+        log.warning("Douyin: 请求失败（可能需要有效 Cookie）")
+        return None
+
+    user = data.get("user", {})
+    if not user:
+        log.warning(f"Douyin: 未找到 user 字段, response keys={list(data.keys())}, status={data.get('status_code')}")
+        return None
+
+    count = safe_int(user.get("follower_count") or user.get("followerCount"))
+    nickname = user.get("nickname", sec_uid[:16])
+
+    if count is not None:
+        log.info(f"Douyin [{nickname}]: {count:,} 粉丝")
+        return count
+
+    log.warning(f"Douyin: 无法解析粉丝数, keys={list(user.keys())}")
+    return None
+
+
+# ============================================================
+# 邮件通知 / Email Notification
+# ============================================================
+def send_cookie_expired_email():
+    """
+    发送 Douyin Cookie 过期提醒邮件
+    需要环境变量: SMTP_USERNAME, SMTP_PASSWORD
+    """
+    smtp_user = os.environ.get("SMTP_USERNAME", "")
+    smtp_pass = os.environ.get("SMTP_PASSWORD", "")
+
+    if not smtp_user or not smtp_pass:
+        log.warning("邮件通知: 未配置 SMTP_USERNAME 或 SMTP_PASSWORD，跳过")
+        return False
+
+    to_email = "digger-yu@outlook.com"
+    subject = "[雷军粉丝追踪] 抖音 Cookie 已过期，请更新"
+
+    body = f"""你好，
+
+抖音粉丝数据获取失败，可能是 Cookie 已过期。
+
+请登录以下步骤更新 Cookie：
+1. 浏览器访问 https://www.douyin.com 并登录
+2. 按 F12 打开开发者工具
+3. 切换到 Network 标签
+4. 刷新页面，找到任意请求
+5. 复制 Request Headers 中的 Cookie 值
+6. 更新到 GitHub Secrets: Settings → Secrets → DOUYIN_COOKIE
+
+仓库地址: https://github.com/digger-yu/lei/settings/secrets/actions
+
+时间: {datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}
+
+---
+此邮件由 GitHub Actions 自动发送
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        with smtplib.SMTP("smtp-mail.outlook.com", 587) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        log.info(f"邮件通知: 已发送到 {to_email}")
+        return True
+    except Exception as e:
+        log.error(f"邮件通知: 发送失败: {e}")
+        return False
+
+
+# ============================================================
+# 主逻辑 / Main
+# ============================================================
+def load_data():
+    """加载已有数据文件"""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"weibo_uid": WEIBO_UID, "douyin_sec_uid": DOUYIN_SEC_UID, "records": []}
+
+
+def save_data(data):
+    """保存数据到文件"""
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log.info(f"数据已保存到 {DATA_FILE}")
+
+
+def main():
+    overwrite = "--overwrite" in sys.argv
+    test_mode = "--test" in sys.argv
+
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+
+    # 加载已有数据
+    data = load_data()
+
+    # 检查今日是否已有记录
+    existing = [r for r in data["records"] if r["date"] == today]
+    if existing and not overwrite:
+        log.info(f"今日 ({today}) 数据已存在，跳过。使用 --overwrite 可强制更新")
+        return
+
+    log.info(f"开始获取雷军粉丝数据 ({today})...")
+
+    weibo = fetch_weibo_followers()
+    douyin = fetch_douyin_followers()
+
+    # 抖音失败时发送邮件通知
+    if douyin is None:
+        log.warning("Douyin: 数据获取失败，发送 Cookie 过期提醒邮件")
+        send_cookie_expired_email()
+
+    if weibo is None and douyin is None:
+        log.error("所有平台数据获取均失败，本次不写入")
+        sys.exit(1)
+
+    record = {
+        "date": today,
+        "weibo": weibo,
+        "douyin": douyin,
+    }
+
+    if test_mode:
+        log.info(f"[测试模式] 获取结果: {json.dumps(record, ensure_ascii=False)}")
+        return
+
+    # 更新或追加记录
+    if existing:
+        data["records"] = [r for r in data["records"] if r["date"] != today]
+    data["records"].append(record)
+    data["records"].sort(key=lambda r: r["date"])
+
+    save_data(data)
+    log.info("完成!")
+
+
+if __name__ == "__main__":
+    main()

@@ -20,6 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,14 +37,33 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: python scripts/fetch_data.py
 
+      - name: Verify data file was updated
+        run: |
+          echo "===== docs/data.json 状态 ====="
+          ls -la docs/data.json
+          echo "===== 最近 5 条记录 ====="
+          python -c "import json; d=json.load(open('docs/data.json',encoding='utf-8')); [print(r) for r in d['records'][-5:]]"
+
       - name: Commit and push data
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/data.json
+
+          # 把所有变更加进暂存区（不局限于 data.json，方便诊断）
+          git add -A
+
+          echo "===== git status ====="
+          git status
+          echo "===== git diff --cached 摘要 ====="
+          git diff --cached --stat
+
           if git diff --cached --quiet; then
             echo "数据无变化，跳过提交"
-          else
-            git commit -m "chore: 更新粉丝数据 $(date +'%Y-%m-%d')"
-            git push
+            exit 0
           fi
+
+          git commit -m "chore: 更新粉丝数据 $(date -u +'%Y-%m-%d')"
+          echo "===== git push ====="
+          git push
+          echo "===== push 完成 ====="

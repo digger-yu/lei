@@ -1,23 +1,31 @@
 name: Deploy GitHub Pages
 
 on:
+  # docs/ 目录有变更时自动部署
   push:
     branches: [main]
     paths:
       - "docs/**"
-  workflow_dispatch:
+  workflow_dispatch: # 支持手动触发
+  # 也监听 daily-fetch 完成事件，避免 GITHUB_TOKEN push 触发不到 push 事件的边界问题
+  workflow_run:
+    workflows: ["每日获取雷军粉丝数据"]
+    types: [completed]
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
-concurrency:
-  group: pages
-  cancel-in-progress: true
+# 不再使用 cancel-in-progress:
+# 旧配置曾导致 daily-fetch 推送后 pages 部署被错误取消
 
 jobs:
   deploy:
+    # 过滤掉失败/取消的 daily-fetch
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -25,6 +33,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

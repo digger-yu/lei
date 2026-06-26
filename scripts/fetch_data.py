@@ -51,46 +51,68 @@ HEADERS_MOBILE = {
 # ============================================================
 # 网络请求工具 / HTTP helpers
 # ============================================================
-def http_get_json(url, headers=None, extra_headers=None, timeout=TIMEOUT):
-    """发送 GET 请求并返回 JSON，失败返回 None"""
-    hdrs = dict(headers or HEADERS_MOBILE)
-    if extra_headers:
-        hdrs.update(extra_headers)
-    req = Request(url, headers=hdrs, method="GET")
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            body = resp.read().decode(charset, errors="replace")
-            return json.loads(body)
-    except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:300]
-        log.error(f"HTTP {e.code} for {url}, body: {body}")
-    except URLError as e:
-        log.error(f"URL error for {url}: {e.reason}")
-    except json.JSONDecodeError as e:
-        log.error(f"JSON parse error for {url}: {e}, body preview: {body[:200] if 'body' in dir() else 'N/A'}")
-    except Exception as e:
-        log.error(f"Request failed for {url}: {e}")
+def http_get_json(url, headers=None, extra_headers=None, timeout=TIMEOUT, retries=3):
+    """发送 GET 请求并返回 JSON，失败返回 None（带重试）"""
+    last_err = None
+    for attempt in range(retries):
+        hdrs = dict(headers or HEADERS_MOBILE)
+        if extra_headers:
+            hdrs.update(extra_headers)
+        req = Request(url, headers=hdrs, method="GET")
+        body = ""
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                body = resp.read().decode(charset, errors="replace")
+                return json.loads(body)
+        except HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+            last_err = f"HTTP {e.code} for {url}, body: {body}"
+            log.error(last_err)
+        except URLError as e:
+            last_err = f"URL error for {url}: {e.reason}"
+            log.error(last_err)
+        except json.JSONDecodeError as e:
+            last_err = f"JSON parse error for {url}: {e}, body preview: {body[:200]}"
+            log.error(last_err)
+        except Exception as e:
+            last_err = f"Request failed for {url}: {e}"
+            log.error(last_err)
+        # 指数退避重试
+        if attempt < retries - 1:
+            wait = 2 ** attempt
+            log.info(f"第 {attempt + 1} 次重试，等待 {wait}s...")
+            time.sleep(wait)
     return None
 
 
-def http_get_html(url, headers=None, extra_headers=None, timeout=TIMEOUT):
-    """发送 GET 请求并返回 HTML 文本，失败返回 None"""
-    hdrs = dict(headers or HEADERS_MOBILE)
-    if extra_headers:
-        hdrs.update(extra_headers)
-    req = Request(url, headers=hdrs, method="GET")
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read().decode(charset, errors="replace")
-    except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:300]
-        log.error(f"HTTP {e.code} for {url}, body: {body}")
-    except URLError as e:
-        log.error(f"URL error for {url}: {e.reason}")
-    except Exception as e:
-        log.error(f"Request failed for {url}: {e}")
+def http_get_html(url, headers=None, extra_headers=None, timeout=TIMEOUT, retries=3):
+    """发送 GET 请求并返回 HTML 文本，失败返回 None（带重试）"""
+    last_err = None
+    for attempt in range(retries):
+        hdrs = dict(headers or HEADERS_MOBILE)
+        if extra_headers:
+            hdrs.update(extra_headers)
+        req = Request(url, headers=hdrs, method="GET")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return resp.read().decode(charset, errors="replace")
+        except HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+            last_err = f"HTTP {e.code} for {url}, body: {body}"
+            log.error(last_err)
+        except URLError as e:
+            last_err = f"URL error for {url}: {e.reason}"
+            log.error(last_err)
+        except Exception as e:
+            last_err = f"Request failed for {url}: {e}"
+            log.error(last_err)
+        # 指数退避重试
+        if attempt < retries - 1:
+            wait = 2 ** attempt
+            log.info(f"第 {attempt + 1} 次重试，等待 {wait}s...")
+            time.sleep(wait)
     return None
 
 
@@ -286,9 +308,23 @@ def fetch_douyin_followers_api(sec_uid=DOUYIN_SEC_UID):
     return None, None
 
 
+def _save_debug_html(html, label="douyin"):
+    """失败时保存 HTML 到 .uploads/ 供排查"""
+    try:
+        today = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".uploads")
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{label}_{today}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html[:10000])  # 只保存前 10KB
+        log.info(f"调试 HTML 已保存到 {path}")
+    except Exception as e:
+        log.warning(f"保存调试 HTML 失败: {e}")
+
+
 def fetch_douyin_followers_ssr(sec_uid=DOUYIN_SEC_UID):
     """
-    方案二：直接抓取用户主页 HTML，从 RENDER_DATA 中解析粉丝数
+    方案二：直接抓取用户主页 HTML，从多种数据源中解析粉丝数
     优点：不需要 Cookie，不依赖 _signature / X-Bogus 签名
     缺点：依赖前端 SSR 注入结构；IP 触发风控时拿到的是滑块挑战页
     """
@@ -305,6 +341,7 @@ def fetch_douyin_followers_ssr(sec_uid=DOUYIN_SEC_UID):
     # 0) 反爬挑战页检测：拿到的是 byted_acrawler 滑块页时直接判定为失败
     if "byted_acrawler" in html or "__ac_signature" in html or "_$jsvmprt" in html:
         log.warning("Douyin[SSR]: 命中反爬挑战页（byted_acrawler），本方案不可用")
+        _save_debug_html(html, "douyin_challenge")
         return None, None
 
     # 1) 优先尝试 RENDER_DATA 结构化解析
@@ -323,6 +360,26 @@ def fetch_douyin_followers_ssr(sec_uid=DOUYIN_SEC_UID):
                     log.info(f"Douyin[SSR-RENDER] [{nickname}]: {count:,} 粉丝")
                     return count, nickname
 
+    # 1.5) 尝试 _ROUTER_DATA 或 __NEXT_DATA__ 等其他注入数据
+    for data_id in ("_ROUTER_DATA", "__NEXT_DATA__"):
+        m = re.search(rf'<script id="{data_id}"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if m:
+            try:
+                from urllib.parse import unquote
+                raw = unquote(m.group(1))
+                blob = raw
+                for key in ("follower_count", "followerCount"):
+                    km = re.search(rf'"{key}"\s*:\s*(\d+)', blob)
+                    if km:
+                        count = _normalize_douyin_count(km.group(1))
+                        nick_m = re.search(r'"nickname"\s*:\s*"([^"]+)"', blob)
+                        nickname = nick_m.group(1) if nick_m else sec_uid[:16]
+                        if count is not None:
+                            log.info(f"Douyin[SSR-{data_id}] [{nickname}]: {count:,} 粉丝")
+                            return count, nickname
+            except Exception as e:
+                log.warning(f"Douyin[SSR-{data_id}] 解析失败: {e}")
+
     # 2) Fallback: HTML 正则匹配「粉丝 xxx 万」
     m = re.search(r"粉丝\s*([\d.]+)\s*万", html)
     if m:
@@ -331,26 +388,52 @@ def fetch_douyin_followers_ssr(sec_uid=DOUYIN_SEC_UID):
             log.info(f"Douyin[SSR-Regex] [{sec_uid[:16]}]: {count:,} 粉丝")
             return count, None
 
-    log.warning("Douyin[SSR]: 两种解析方式均未命中粉丝数")
+    # 2.5) Fallback: 从 <title> 标签提取粉丝数（格式如 "雷军 - 抖音" 或 "雷军的抖音主页,粉丝:4248.0万"）
+    title_m = re.search(r"<title>(.*?)</title>", html, re.DOTALL | re.IGNORECASE)
+    if title_m:
+        title_text = title_m.group(1).strip()
+        # 匹配 "粉丝:4248.0万" 或 "粉丝：4248万" 等格式
+        fan_m = re.search(r"粉丝[：:]\s*([\d.]+)\s*万?", title_text)
+        if fan_m:
+            raw_fan = fan_m.group(1)
+            if "万" in title_text[fan_m.start():fan_m.end() + 1]:
+                raw_fan += "万"
+            count = safe_int(raw_fan)
+            if count is not None:
+                log.info(f"Douyin[SSR-Title] [{sec_uid[:16]}]: {count:,} 粉丝")
+                return count, None
+
+    # 全部解析方式均未命中，保存 HTML 供排查
+    log.warning("Douyin[SSR]: 所有解析方式均未命中粉丝数")
+    _save_debug_html(html, "douyin_no_match")
     return None, None
 
 
 def fetch_douyin_followers(sec_uid=DOUYIN_SEC_UID):
     """
     抖音粉丝数获取入口：先尝试方案一（API + Cookie），失败时自动 fallback 到方案二（SSR）
+    最多重试 3 轮，每轮间隔 60 秒（指数退避）
     返回粉丝数（int）或 None
     """
-    # 方案一：API + Cookie
-    count, nickname = fetch_douyin_followers_api(sec_uid)
-    if count is not None:
-        return count
+    max_rounds = 3
+    for round_idx in range(max_rounds):
+        # 方案一：API + Cookie
+        count, nickname = fetch_douyin_followers_api(sec_uid)
+        if count is not None:
+            return count
 
-    log.info("Douyin: 方案一（API）失败，自动切换到方案二（SSR 抓取用户主页）")
-    count, nickname = fetch_douyin_followers_ssr(sec_uid)
-    if count is not None:
-        return count
+        log.info("Douyin: 方案一（API）失败，自动切换到方案二（SSR 抓取用户主页）")
+        count, nickname = fetch_douyin_followers_ssr(sec_uid)
+        if count is not None:
+            return count
 
-    log.error("Douyin: 两套获取方案均失败")
+        # 两套方案本轮均失败
+        if round_idx < max_rounds - 1:
+            wait = 60 * (round_idx + 1)
+            log.warning(f"Douyin: 第 {round_idx + 1} 轮两套方案均失败，{wait} 秒后重试（共 {max_rounds} 轮）...")
+            time.sleep(wait)
+
+    log.error("Douyin: 3 轮重试均失败，两套获取方案均无法获取数据")
     return None
 
 
